@@ -1,0 +1,16 @@
+
+=== TPEX PRICE 3293 ===
+200 text/html https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d=114/10/31&s=3293
+<!DOCTYPE html><html lang="zh-Hant-tw"><head><title>404 - è­å¸æ«æª¯è²·è³£ä¸­å¿</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, u
+200 application/json;charset=UTF-8 https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&d=114/10/31&s=3293
+→ close: 
+
+=== TPEX PRICE 6763 ===
+404 text/html https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d=114/10/31&s=6763
+<!DOCTYPE html><html lang="zh-Hant-tw"><head><title>404 - è­å¸æ«æª¯è²·è³£ä¸­å¿</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, u
+200 application/json;charset=UTF-8 https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&d=114/10/31&s=6763
+→ close: 
+
+=== TPEX T86 (full table) ===
+200 text/html https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_result.php?l=zh-tw&se=AL&t=D&d=114/10/31
+<!DOCTYPE html><html lang="zh-Hant-tw"><head><title>404 - è­å¸æ«æª¯è²·è³£ä¸­å¿</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, u

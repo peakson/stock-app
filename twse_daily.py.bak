@@ -1,0 +1,253 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+twse_daily.py
+-------------
+抓取台灣證交所（TWSE）每日收盤資料，輸出單列 CSV，供手動匯入 Google Sheet。
+功能：
+- 三大法人金額總表（BFI82U）
+- 個股三大法人（T86）
+- 個股收盤價（STOCK_DAY）
+使用：
+  pip install requests
+  python3 twse_daily.py                 # 抓今天
+  python3 twse_daily.py 20251031        # 抓指定交易日
+輸出：dailylog_YYYYMMDD.csv（含表頭+一列資料）
+"""
+
+import sys
+import time
+import csv
+import json
+import datetime as dt
+from pathlib import Path
+from typing import Dict, Any
+
+import requests
+
+# === 自選股與設定 ===
+WATCHLIST_TWSE = ['2258','2308','2317','2330','2357','2454','2753']
+WATCHLIST_TPEX = ['3293','6763']  # 先占位
+
+def load_watchlist():
+    p = Path(__file__).with_name("watchlist.json")
+    if p.exists():
+        try:
+            cfg = json.loads(p.read_text(encoding="utf-8"))
+            tw = cfg.get("twse") or WATCHLIST_TWSE
+            tp = cfg.get("tpex") or WATCHLIST_TPEX
+            return list(map(str, tw)), list(map(str, tp))
+        except Exception:
+            pass
+    return WATCHLIST_TWSE, WATCHLIST_TPEX
+
+# === TWSE RWD endpoints ===
+def url_t86(ymd):     return f"https://www.twse.com.tw/rwd/zh/fund/T86?date={ymd}&selectType=ALL&response=json"
+def url_bfi82u(ymd):  return f"https://www.twse.com.tw/rwd/zh/fund/BFI82U?date={ymd}&response=json"
+def url_stock_day(yyyymm, code):
+    return f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?response=json&date={yyyymm}01&stockNo={code}"
+
+def ymd_today(): return dt.datetime.now().strftime("%Y%m%d")
+
+# === Anti-scraping aware session/fetch ===
+def twse_session(seed_path="/rwd/zh/fund/BFI82U") -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) PythonRequests",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
+    try:
+        s.get("https://www.twse.com.tw" + seed_path, timeout=15)  # 拿 Cookie
+    except Exception:
+        pass
+    return s
+
+def twse_fetch_json(s: requests.Session, url: str, referer_path: str) -> Dict[str, Any]:
+    hdr = {
+        "Accept": "application/json, text/javascript,*/*;q=0.1",
+        "Referer": "https://www.twse.com.tw" + referer_path,
+        "X-Requested-With": "XMLHttpRequest",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    r1 = s.get(url, headers=hdr, allow_redirects=False, timeout=30)
+    ct1 = r1.headers.get("Content-Type", "")
+    if r1.ok and "application/json" in ct1:
+        return r1.json()
+    if r1.status_code in (301, 302, 307):
+        loc = r1.headers.get("Location")
+        if loc:
+            if not loc.startswith("http"):
+                loc = "https://www.twse.com.tw" + loc
+            r2 = s.get(loc, headers=hdr, timeout=30)
+            ct2 = r2.headers.get("Content-Type", "")
+            if r2.ok and "application/json" in ct2:
+                return r2.json()
+            raise RuntimeError(f"Redirected but not JSON: code={r2.status_code}, ct={ct2}, body[:160]={r2.text[:160]}")
+    raise RuntimeError(f"Fetch fail: code={r1.status_code}, ct={ct1}, body[:160]={r1.text[:160]} | url={url}")
+
+# === Parsers ===
+def parse_bfi82u(obj):
+    """
+    兼容多種中文標籤：
+    - 外資及陸資（不含外資自營商）/ 外資（不含自營商）
+    - 投信
+    - 自營商（合計） 或 自營商（自行買賣）＋（避險）加總
+    - 三大法人合計/買賣超金額合計
+    """
+    fxBuy=fxSell=fxNet=""
+    itBuy=itSell=itNet=""
+    propBuy=propSell=propNet=""
+    totalNet=""
+
+    rows = (obj.get("data") or [])
+    # 暫存自營商分項，若沒有「合計」就用兩者加總
+    prop_parts = {"buy": [], "sell": [], "net": []}
+
+    def n(x):
+        try:
+            return float(str(x).replace(",", ""))
+        except:
+            return None
+
+    for r in rows:
+        label = str(r[0] or "").replace(" ", "")
+        buy, sell, net = r[1], r[2], r[3]
+
+        # 外資：避開自營商關鍵字；容許「外資及陸資」「不含自營商」
+        if ("外資" in label or "外資及陸資" in label) and ("自營商" not in label) and ("合計" not in label):
+            fxBuy, fxSell, fxNet = buy, sell, net
+            continue
+
+        # 投信
+        if "投信" in label and ("合計" not in label):
+            itBuy, itSell, itNet = buy, sell, net
+            continue
+
+        # 自營商：優先抓「合計」，否則記錄分項等會相加
+        if "自營商" in label:
+            if "合計" in label:
+                propBuy, propSell, propNet = buy, sell, net
+            else:
+                # 自行買賣 / 避險
+                if n(buy) is not None:  prop_parts["buy"].append(n(buy))
+                if n(sell) is not None: prop_parts["sell"].append(n(sell))
+                if n(net) is not None:  prop_parts["net"].append(n(net))
+            continue
+
+        # 三大法人合計（買賣超）
+        if ("三大法人" in label or "合計" in label) and ("買賣超" in label):
+            totalNet = net
+            continue
+
+    # 若自營商沒有「合計」那列，就把分項相加
+    if propNet == "" and (prop_parts["buy"] or prop_parts["sell"] or prop_parts["net"]):
+        sbuy  = sum([x for x in prop_parts["buy"]  if x is not None])
+        ssell = sum([x for x in prop_parts["sell"] if x is not None])
+        snet  = sum([x for x in prop_parts["net"]  if x is not None])
+        # 轉回帶千分位字串（和原格式一致；你要純數字也可以直接回 float）
+        propBuy  = f"{int(sbuy):,}"
+        propSell = f"{int(ssell):,}"
+        propNet  = f"{int(snet):,}"
+
+    return [fxBuy, fxSell, fxNet, itBuy, itSell, itNet, propBuy, propSell, propNet, totalNet]
+
+def build_t86_map(obj: Dict[str, Any]):
+    out = {}
+    for r in (obj.get("data") or []):
+        code = str(r[0]).strip()
+        out[code] = {
+            "fx": _to_num(r[2]),
+            "it": _to_num(r[3]),
+            "prop": _to_num(r[4]),
+            "sum": _to_num(r[5]),
+        }
+    return out
+
+def pick_close_for_date(obj: Dict[str, Any], ymd: str):
+    if not obj or not obj.get("data") or not obj.get("fields"):
+        return ""
+    fields = obj["fields"]
+    if "日期" not in fields or "收盤價" not in fields:
+        return ""
+    d_idx = fields.index("日期")
+    c_idx = fields.index("收盤價")
+    roc = f"{int(ymd[:4]) - 1911}/{ymd[4:6]}/{ymd[6:8]}"
+    for row in obj["data"]:
+        if str(row[d_idx]).strip() == roc:
+            return _to_num(row[c_idx])
+    return ""
+
+def _to_num(x):
+    try:
+        return float(str(x).replace(",", ""))
+    except Exception:
+        return ""
+
+# === Header / Row ===
+def build_header(w_twse, w_tpex):
+    base = [
+        'Date(YYYYMMDD)',
+        '外資買進金額','外資賣出金額','外資買賣超',
+        '投信買進金額','投信賣出金額','投信買賣超',
+        '自營商買進金額','自營商賣出金額','自營商買賣超',
+        '三大法人合計買賣超'
+    ]
+    per = []
+    for c in w_twse:
+        per += [f"{c}_收盤價", f"{c}_外資張", f"{c}_投信張", f"{c}_自營商張", f"{c}_合計張"]
+    for c in w_tpex:
+        per += [f"{c}_收盤價", f"{c}_外資張", f"{c}_投信張", f"{c}_自營商張", f"{c}_合計張"]
+    return base + per
+
+def main():
+    ymd = (sys.argv[1] if len(sys.argv) > 1 else ymd_today()).strip()
+    if len(ymd) != 8 or not ymd.isdigit():
+        print("請輸入 YYYYMMDD，例如：20251031")
+        sys.exit(1)
+    yyyymm = ymd[:6]
+
+    w_twse, w_tpex = load_watchlist()
+    s = twse_session("/rwd/zh/fund/BFI82U")
+
+    # 1) 三大法人金額
+    bfi_obj = twse_fetch_json(s, url_bfi82u(ymd), "/rwd/zh/fund/BFI82U")
+    bfi = parse_bfi82u(bfi_obj)
+
+    # 2) 個股三大法人（上市）
+    t86_obj = twse_fetch_json(s, url_t86(ymd), "/rwd/zh/fund/T86")
+    t86map = build_t86_map(t86_obj)
+
+    # 3) 個股收盤價（上市）
+    price_map = {}
+    for code in w_twse:
+        obj = twse_fetch_json(s, url_stock_day(yyyymm, code), "/rwd/zh/afterTrading/stockDay")
+        time.sleep(0.25)  # 節流
+        price_map[code] = pick_close_for_date(obj, ymd)
+
+    # 組合輸出列
+    base = [ymd] + bfi
+    per_twse = []
+    for code in w_twse:
+        m = t86map.get(code, {})
+        per_twse += [price_map.get(code, ""),
+                     m.get("fx", ""), m.get("it", ""), m.get("prop", ""), m.get("sum", "")]
+    per_tpex = ["", "", "", "", ""] * len(w_tpex)  # 先占位
+
+    header = build_header(w_twse, w_tpex)
+    row = base + per_twse + per_tpex
+
+    out = Path(f"dailylog_{ymd}.csv")
+    with out.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerow(row)
+
+    print(f"✅ 輸出 {out.name}，可直接匯入/貼到 Google Sheet 的 DailyLog")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
