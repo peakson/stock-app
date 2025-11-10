@@ -25,6 +25,7 @@ import time
 import csv
 import json
 import datetime as dt
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
@@ -262,6 +263,81 @@ def _to_num(x):
     except Exception:
         return ""
 
+@dataclass
+class InvestorSnapshot:
+    price: Any = ""
+    fx: Any = ""
+    it: Any = ""
+    prop: Any = ""
+    total: Any = ""
+
+    def as_row(self) -> List[Any]:
+        return [self.price, self.fx, self.it, self.prop, self.total]
+
+def fetch_twse_section(ymd: str, watchlist: List[str]) -> tuple[List[Any], Dict[str, InvestorSnapshot]]:
+    yyyymm = ymd[:6]
+    seed = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"
+    session = make_session(seed)
+
+    bfi_obj = fetch_json_with_referer(session, twse_url_bfi82u(ymd), seed) or {}
+    bfi = parse_bfi82u(bfi_obj)
+
+    t86_obj = fetch_json_with_referer(
+        session,
+        twse_url_t86(ymd),
+        "https://www.twse.com.tw/rwd/zh/fund/T86",
+    ) or {}
+    t86_map = build_t86_map(t86_obj)
+
+    snapshots: Dict[str, InvestorSnapshot] = {}
+    for code in watchlist:
+        sd_obj = fetch_json_with_referer(
+            session,
+            twse_url_stock_day(yyyymm, code),
+            "https://www.twse.com.tw/rwd/zh/afterTrading/stockDay",
+        ) or {}
+        time.sleep(0.25)
+        metrics = t86_map.get(code, {})
+        snapshots[code] = InvestorSnapshot(
+            price=pick_close_for_date(sd_obj, ymd),
+            fx=metrics.get("fx", ""),
+            it=metrics.get("it", ""),
+            prop=metrics.get("prop", ""),
+            total=metrics.get("sum", ""),
+        )
+
+    return bfi, snapshots
+
+def fetch_tpex_section(ymd: str, watchlist: List[str]) -> Dict[str, InvestorSnapshot]:
+    roc = ymd_to_roc(ymd)
+    seed = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php?l=zh-tw"
+    session = make_session(seed)
+
+    price_map: Dict[str, Any] = {}
+    for code in watchlist:
+        pobj = fetch_json_try(session, tpex_price_candidates(roc, code), seed)
+        price_map[code] = tpex_pick_close(pobj, ymd) if pobj else ""
+
+    t86_tpex_obj = fetch_json_try(
+        session,
+        tpex_t86_candidates(roc),
+        "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade.php?l=zh-tw",
+    )
+    full_map = tpex_build_t86_map(t86_tpex_obj) if t86_tpex_obj else {}
+
+    snapshots: Dict[str, InvestorSnapshot] = {}
+    for code in watchlist:
+        metrics = full_map.get(code, {})
+        snapshots[code] = InvestorSnapshot(
+            price=price_map.get(code, ""),
+            fx=metrics.get("fx", ""),
+            it=metrics.get("it", ""),
+            prop=metrics.get("prop", ""),
+            total=metrics.get("sum", ""),
+        )
+
+    return snapshots
+
 def build_header(w_twse, w_tpex):
     base = [
         'Date(YYYYMMDD)',
@@ -275,58 +351,26 @@ def build_header(w_twse, w_tpex):
     for c in w_tpex: per += [f"{c}_收盤價",f"{c}_外資張",f"{c}_投信張",f"{c}_自營商張",f"{c}_合計張"]
     return base+per
 
+def build_investor_rows(order: List[str], snapshots: Dict[str, InvestorSnapshot]) -> List[Any]:
+    out: List[Any] = []
+    for code in order:
+        snap = snapshots.get(code) or InvestorSnapshot()
+        out.extend(snap.as_row())
+    return out
+
 # ====== Main ======
 def main():
     ymd = (sys.argv[1] if len(sys.argv)>1 else ymd_today()).strip()
     if len(ymd)!=8 or not ymd.isdigit():
         print("請輸入 YYYYMMDD，例如：20251031"); return 1
-    yyyymm = ymd[:6]; roc = ymd_to_roc(ymd)
 
     w_twse, w_tpex = load_watchlist()
 
-    # --- TWSE ---
-    twse_seed = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"
-    twse = make_session(twse_seed)
-    bfi_obj  = fetch_json_with_referer(twse, twse_url_bfi82u(ymd), twse_seed) or {}
-    bfi      = parse_bfi82u(bfi_obj)
-    t86_obj  = fetch_json_with_referer(twse, twse_url_t86(ymd),  "https://www.twse.com.tw/rwd/zh/fund/T86") or {}
-    t86_map  = build_t86_map(t86_obj)
-    price_twse={}
-    for code in w_twse:
-        sd_obj = fetch_json_with_referer(twse, twse_url_stock_day(yyyymm, code), "https://www.twse.com.tw/rwd/zh/afterTrading/stockDay") or {}
-        time.sleep(0.25)
-        price_twse[code] = pick_close_for_date(sd_obj, ymd)
-
-    # --- TPEx ---
-    tpex_seed = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php?l=zh-tw"
-    tpex = make_session(tpex_seed)
-
-    price_tpex={}
-    tpex_map={}
-    for code in w_tpex:
-        pobj = fetch_json_try(tpex, tpex_price_candidates(roc, code), tpex_seed)
-        price_tpex[code] = tpex_pick_close(pobj, ymd) if pobj else ""
-
-    t86_tpex_obj = fetch_json_try(tpex, tpex_t86_candidates(roc), "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade.php?l=zh-tw")
-    if t86_tpex_obj:
-        full_map = tpex_build_t86_map(t86_tpex_obj)
-        for code in w_tpex:
-            tpex_map[code] = full_map.get(code, {})
-
-    # --- 組合輸出列 ---
-    base = [ymd] + bfi
-    per_twse=[]
-    for code in w_twse:
-        m=t86_map.get(code,{})
-        per_twse += [price_twse.get(code,""), m.get("fx",""), m.get("it",""), m.get("prop",""), m.get("sum","")]
-
-    per_tpex=[]
-    for code in w_tpex:
-        m=tpex_map.get(code,{})
-        per_tpex += [price_tpex.get(code,""), m.get("fx",""), m.get("it",""), m.get("prop",""), m.get("sum","")]
+    bfi, twse_snapshots = fetch_twse_section(ymd, w_twse)
+    tpex_snapshots = fetch_tpex_section(ymd, w_tpex)
 
     header = build_header(w_twse, w_tpex)
-    row = base + per_twse + per_tpex
+    row = [ymd] + bfi + build_investor_rows(w_twse, twse_snapshots) + build_investor_rows(w_tpex, tpex_snapshots)
 
     out = Path(f"dailylog_{ymd}.csv")
     with out.open("w", newline="", encoding="utf-8") as f:
